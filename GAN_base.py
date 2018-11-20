@@ -1,3 +1,6 @@
+import tensorflow as tf
+from keras.engine import Layer
+
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,25 +14,43 @@ from keras.optimizers import Adam, RMSprop, Adadelta, SGD
 from keras.datasets import mnist
 from keras import backend as K
 
+from flipGradientTF import GradientReversal  # https://github.com/michetonu/gradient_reversal_keras_tf
+
+
+# TODO
+"""
+regularization on loss
+model weight history
+occasionally switch labels
+
+"""
 
 class Args:
     # network parameters
-    batch_size = 128
-    number_of_batches = 50000
-    log_frequency = 1000
+    batch_size = 256
+    number_of_batches = 5000*128//batch_size//1
+    log_frequency = number_of_batches/50
 
     latent_dim = 2
-    intermediate_dim = 32
-    node_count = 8
+    node_count = 2**5
 
     original_dim = None
     input_shape = None
 
     temp_folder = 'temp_folder'
 
+    memory_divider = 4
+
 
 class DataContainer:
     def __init__(self):
+        self.memory = None
+        self.memory_point = 0
+        self.update_size = Args.batch_size//Args.memory_divider
+
+        self.init_data()
+
+    def init_data(self):
         # MNIST dataset
         (x_train, y_train), (x_test, y_test) = mnist.load_data()
 
@@ -43,9 +64,16 @@ class DataContainer:
         self.x_train = x_train.astype('float32') / 255
         self.x_test = x_test.astype('float32') / 255
 
+        batch_indices = np.random.randint(0, self.x_train.shape[0], size=Args.batch_size)
+        self.memory = batch_indices
+
     def data_generator(self, batch_size=Args.batch_size):
-        batch_indices = np.random.randint(0, self.x_train.shape[0], size=batch_size)
-        return self.x_train[batch_indices]
+        self.memory[self.memory_point*self.update_size:(self.memory_point+1)*self.update_size] = \
+            np.random.randint(0, self.x_train.shape[0], size=self.update_size)
+
+        self.memory_point = (self.memory_point+1)%Args.memory_divider
+
+        return self.x_train[self.memory]
 
     def binary_noise(self, max_noise=0.3, size=Args.batch_size):
         binary = np.random.choice([-1, 1-max_noise, 0-max_noise/2], size=(size, Args.latent_dim,),
@@ -66,9 +94,9 @@ class ModelContainer:
         self.discriminator = None
 
     def make_model(self):
-        def base_conv(x, nodes=Args.intermediate_dim, mode=None, dropout=True):
+        def base_conv(x, nodes=Args.node_count, mode=None, dropout=True):
             if dropout:
-                x = Dropout(.25)(x)
+                x = Dropout(.5)(x)
             x = Conv2D(nodes, (3, 3), padding='same')(x)
             # x = BatchNormalization()(x)
             x = LeakyReLU()(x)
@@ -78,7 +106,7 @@ class ModelContainer:
                 x = AveragePooling2D()(x)
             return x
 
-        def base_dense(x, nodes=Args.intermediate_dim, dropout=True):
+        def base_dense(x, nodes=Args.node_count, dropout=True):
             if dropout:
                 x = Dropout(.25)(x)
             x = Dense(nodes)(x)
@@ -92,15 +120,17 @@ class ModelContainer:
             layer = base_conv(layer, Args.node_count * 4, 'up')
             layer = base_conv(layer, Args.node_count * 2, 'up')
             layer = base_conv(layer, Args.node_count)
-            output_img = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(layer)
+            output_img = Conv2D(1, (3, 3), activation='simgoid', padding='same')(layer)
             return output_img
 
         def make_discriminator(image_input):
-            layer = base_conv(image_input, Args.node_count, 'down', dropout=False)
+
+            layer = base_conv(image_input, Args.node_count, dropout=False)
+            layer = base_conv(layer, Args.node_count, 'down')
             layer = base_conv(layer, Args.node_count * 2, 'down')
             layer = base_conv(layer, Args.node_count * 4)
             layer = Flatten()(layer)
-            layer = base_dense(layer, Args.node_count)
+            #layer = base_dense(layer, Args.latent_dim*2)
             chance_of_real = Dense(1, activation='sigmoid', name='chance_of_real', use_bias=False)(layer)
             return chance_of_real
 
@@ -122,13 +152,13 @@ class ModelContainer:
         self.discriminator_frozen.name = 'discrimnator_clone'
         self.discriminator_frozen.trainable = False
 
-        gradient_stop_layer = Lambda(lambda x: K.stop_gradient(x), name='stop_gradient')
+        #gradient_stop_layer = Lambda(lambda x: K.stop_gradient(x), name='stop_gradient')
 
         self.validity_of_generator = self.discriminator_frozen(self.generator(latent_inputs))
         self.validity_of_trues = self.discriminator(image_input)
 
-        stopped_gradient = gradient_stop_layer(self.generator(latent_inputs2))
-        self.validity_of_fakes = self.discriminator(stopped_gradient)
+        switch_gradient = GradientReversal(0.1)(self.generator(latent_inputs2))
+        self.validity_of_fakes = self.discriminator(switch_gradient)
 
         self.full_gan = Model([image_input, latent_inputs, latent_inputs2],
                         [self.validity_of_trues, self.validity_of_fakes, self.validity_of_generator])
@@ -143,14 +173,13 @@ class ModelContainer:
 
         predict_loss_3 = K.mean(-K.log(self.validity_of_generator))
 
-        # TODO regularization
 
         gan_loss = K.sum(predict_loss_1 + predict_loss_2 + predict_loss_3)
 
         self.full_gan.add_loss(gan_loss)
 
     def compile_gan(self):
-        opt = Adam(lr=10**-4, clipvalue=0.5)
+        opt = Adam(lr=4*10**-5, clipnorm=.5)
         #opt = RMSprop(lr=10**-4)
         # opt = Adadelta(lr=10**-3)
         # opt = SGD(lr=10**-8)
@@ -169,30 +198,43 @@ class GAN:
         self.md.make_loss()
         self.md.compile_gan()
 
+        self.recent_losses = np.zeros(5)
+
     def main(self):
         self.train()
         self.draw()
 
-    def progress_print(self, loss=0):
+    def progress_print(self):
         predicts = self.md.full_gan.predict([self.dg.x_test,
                                              self.dg.binary_noise(size=self.dg.x_test.shape[0]),
                                              self.dg.binary_noise(size=self.dg.x_test.shape[0])])
 
-        print('time:%5d, trues: %.4f, fakes: %.4f, generator: %.4f, batch_loss: %4.2f' %
-              (time.clock(), np.mean(predicts[0]), np.mean(predicts[1]), np.mean(predicts[2]), loss))
+
+        loss = np.mean(self.recent_losses)
+        loss_variation = np.mean(np.abs(self.recent_losses[1:]-self.recent_losses[:-1]))
+
+        print('time:%5d, trues: %.4f, fakes: %.4f, generator: %.4f, batch_loss: %3.2f, loss_variation: %3.3f' %
+              (time.clock(), np.mean(predicts[0]), np.mean(predicts[1]), np.mean(predicts[2]), loss, loss_variation))
 
     def train(self):
         for i in range(Args.number_of_batches):
-            batch_loss = self.md.full_gan.train_on_batch([self.dg.data_generator(),
-                                                self.dg.binary_noise(), self.dg.binary_noise()], None)
-            self.md.update_frozen()
-
+            self.train_batch()
             if i % Args.log_frequency == 0:
-                self.progress_print(batch_loss)
+
+                for loss_index in range(5):
+                    self.recent_losses[loss_index] = self.train_batch()
+                self.progress_print()
                 self.draw()
-                if np.isnan(batch_loss):
+                if np.isnan(self.recent_losses[0]):
                     print('encountered nan, ending...')
                     quit()
+
+    def train_batch(self):
+        batch_loss = self.md.full_gan.train_on_batch([self.dg.data_generator(),
+                                                      self.dg.binary_noise(), self.dg.binary_noise()], None)
+        self.md.update_frozen()
+
+        return batch_loss
 
     def draw(self):
         if Args.latent_dim != 2:
