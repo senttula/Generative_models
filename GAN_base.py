@@ -15,6 +15,8 @@ from keras import backend as K
 class Args:
     # network parameters
     batch_size = 128
+    number_of_batches = 50000
+    log_frequency = 1000
 
     latent_dim = 2
     intermediate_dim = 32
@@ -22,8 +24,6 @@ class Args:
 
     original_dim = None
     input_shape = None
-
-    epochs = 50
 
     temp_folder = 'temp_folder'
 
@@ -36,7 +36,6 @@ class DataContainer:
         image_size = x_train.shape[1]
         Args.original_dim = image_size * image_size
         Args.input_shape = (x_train.shape[1], x_train.shape[2], 1)
-        print(Args.input_shape)
         # x_train = np.reshape(x_train, [-1, original_dim])
         # x_test = np.reshape(x_test, [-1, original_dim])
         x_train = x_train[:, :, :, np.newaxis]
@@ -87,49 +86,55 @@ class ModelContainer:
             x = LeakyReLU()(x)
             return x
 
+        def make_generator(latent_inputs):
+            layer = base_dense(latent_inputs, 7 * 7 * Args.node_count * 4, dropout=False)
+            layer = Reshape((7, 7, Args.node_count * 4))(layer)
+            layer = base_conv(layer, Args.node_count * 4, 'up')
+            layer = base_conv(layer, Args.node_count * 2, 'up')
+            layer = base_conv(layer, Args.node_count)
+            output_img = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(layer)
+            return output_img
+
+        def make_discriminator(image_input):
+            layer = base_conv(image_input, Args.node_count, 'down', dropout=False)
+            layer = base_conv(layer, Args.node_count * 2, 'down')
+            layer = base_conv(layer, Args.node_count * 4)
+            layer = Flatten()(layer)
+            layer = base_dense(layer, Args.node_count)
+            chance_of_real = Dense(1, activation='sigmoid', name='chance_of_real', use_bias=False)(layer)
+            return chance_of_real
+
         latent_inputs = Input(shape=(Args.latent_dim,), name='latent_in')
         latent_inputs2 = Input(shape=(Args.latent_dim,), name='latent_in2')
         image_input = Input(shape=Args.input_shape, name='image_input')
 
         # generator
-        layer = base_dense(latent_inputs, 7 * 7 * Args.node_count * 4, dropout=False)
-        layer = Reshape((7, 7, Args.node_count * 4))(layer)
-        layer = base_conv(layer, Args.node_count * 4, 'up')
-        layer = base_conv(layer, Args.node_count * 2, 'up')
-        layer = base_conv(layer, Args.node_count)
-        output_img = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(layer)
+        output_img = make_generator(latent_inputs)
         self.generator = Model(latent_inputs, output_img, name='generator')
 
         # discriminator
-        layer = base_conv(image_input, Args.node_count, 'down', dropout=False)
-        layer = base_conv(layer, Args.node_count * 2, 'down')
-        layer = base_conv(layer, Args.node_count * 4)
-        layer = Flatten()(layer)
-        layer = base_dense(layer, Args.node_count // 2)
-        chance_of_real = Dense(1, activation='sigmoid', name='chance_of_real', use_bias=False)(layer)
-
+        chance_of_real = make_discriminator(image_input)
         self.discriminator = Model(image_input, chance_of_real, name='discriminator')
 
+        # frozen discriminator won't be trained, but lets gradient flow through to train generator
+        # its weigths are updated after each batch
         self.discriminator_frozen = clone_model(self.discriminator)
         self.discriminator_frozen.name = 'discrimnator_clone'
         self.discriminator_frozen.trainable = False
-
-        self.discriminator.summary()
-        self.generator.summary()
 
         gradient_stop_layer = Lambda(lambda x: K.stop_gradient(x), name='stop_gradient')
 
         self.validity_of_generator = self.discriminator_frozen(self.generator(latent_inputs))
         self.validity_of_trues = self.discriminator(image_input)
 
-        stop_gradient = gradient_stop_layer(self.generator(latent_inputs2))
-        self.validity_of_fakes = self.discriminator(stop_gradient)
-        #validity_of_fakes = print_layer(validity_of_fakes, 'fake')(validity_of_fakes)
-
+        stopped_gradient = gradient_stop_layer(self.generator(latent_inputs2))
+        self.validity_of_fakes = self.discriminator(stopped_gradient)
 
         self.full_gan = Model([image_input, latent_inputs, latent_inputs2],
                         [self.validity_of_trues, self.validity_of_fakes, self.validity_of_generator])
 
+        self.discriminator.summary()
+        self.generator.summary()
         self.full_gan.summary()
 
     def make_loss(self):
@@ -139,18 +144,13 @@ class ModelContainer:
         predict_loss_3 = K.mean(-K.log(self.validity_of_generator))
 
         # TODO regularization
-        # regularization = K.square(K.square(predict_loss_1 + predict_loss_2 + predict_loss_3))
-        # regularization  = K.abs(predict_loss_mean-predict_loss_1) + K.abs(predict_loss_mean-predict_loss_2) + \
-        #                   K.abs(predict_loss_mean-predict_loss_3)
-        # regularization *= 0.01
-        # regularization = 0# K.mean(-K.log(1-K.mean(validity_of_trues)-K.mean(validity_of_generator)))
 
         gan_loss = K.sum(predict_loss_1 + predict_loss_2 + predict_loss_3)
 
         self.full_gan.add_loss(gan_loss)
 
     def compile_gan(self):
-        opt = Adam(lr=10**-4)
+        opt = Adam(lr=10**-4, clipvalue=0.5)
         #opt = RMSprop(lr=10**-4)
         # opt = Adadelta(lr=10**-3)
         # opt = SGD(lr=10**-8)
@@ -165,37 +165,34 @@ class GAN:
         self.dg = DataContainer()
         self.md = ModelContainer()
 
-    def main(self):
         self.md.make_model()
         self.md.make_loss()
         self.md.compile_gan()
 
+    def main(self):
         self.train()
         self.draw()
 
     def progress_print(self, loss=0):
-        predicts = self.md.full_gan.predict([self.dg.x_test, self.dg.binary_noise(size=self.dg.x_test.shape[0]),
+        predicts = self.md.full_gan.predict([self.dg.x_test,
+                                             self.dg.binary_noise(size=self.dg.x_test.shape[0]),
                                              self.dg.binary_noise(size=self.dg.x_test.shape[0])])
 
         print('time:%5d, trues: %.4f, fakes: %.4f, generator: %.4f, batch_loss: %4.2f' %
               (time.clock(), np.mean(predicts[0]), np.mean(predicts[1]), np.mean(predicts[2]), loss))
 
-
     def train(self):
-        t = 500
-        for i in range(2000*50):
-
+        for i in range(Args.number_of_batches):
             batch_loss = self.md.full_gan.train_on_batch([self.dg.data_generator(),
                                                 self.dg.binary_noise(), self.dg.binary_noise()], None)
             self.md.update_frozen()
 
-            if i % t == 0:
+            if i % Args.log_frequency == 0:
                 self.progress_print(batch_loss)
                 self.draw()
                 if np.isnan(batch_loss):
-                    print('nan')
+                    print('encountered nan, ending...')
                     quit()
-
 
     def draw(self):
         if Args.latent_dim != 2:
@@ -247,8 +244,7 @@ def make_gif():
     except Exception as e:
         print(e)
 
-
-if __name__ == '__main__':
+def clean_folder():
     os.makedirs(Args.temp_folder, exist_ok=True)
     for the_file in os.listdir(Args.temp_folder):
         file_path = os.path.join(Args.temp_folder, the_file)
@@ -257,6 +253,9 @@ if __name__ == '__main__':
                 os.unlink(file_path)
         except Exception as e:
             print(e)
+
+if __name__ == '__main__':
+    clean_folder()
 
     gan_class = GAN()
     gan_class.main()
