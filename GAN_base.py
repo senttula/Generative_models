@@ -9,7 +9,7 @@ import glob
 
 from keras.layers import Lambda, Input, Dense, Conv2D, UpSampling2D, Flatten, Reshape, Dropout, LeakyReLU, \
     AveragePooling2D
-from keras.models import Model, clone_model
+from keras.models import Model, clone_model, load_model
 from keras.optimizers import Adam, RMSprop, Adadelta, SGD
 from keras.datasets import mnist
 from keras import backend as K
@@ -20,19 +20,18 @@ from flipGradientTF import GradientReversal  # https://github.com/michetonu/grad
 # TODO
 """
 regularization on loss
-model weight history
 occasionally switch labels
-
+residuality
 """
 
 class Args:
     # network parameters
-    batch_size = 256
-    number_of_batches = 5000*128//batch_size//1
-    log_frequency = number_of_batches/50
+    batch_size = 512
+    number_of_batches = 5000*128//batch_size//1*30
+    log_frequency = number_of_batches//50
 
     latent_dim = 2
-    node_count = 2**5
+    node_count = 2**3
 
     original_dim = None
     input_shape = None
@@ -67,20 +66,23 @@ class DataContainer:
         batch_indices = np.random.randint(0, self.x_train.shape[0], size=Args.batch_size)
         self.memory = batch_indices
 
+        self.binary_memory = self.binary_noise()
+
     def data_generator(self, batch_size=Args.batch_size):
         self.memory[self.memory_point*self.update_size:(self.memory_point+1)*self.update_size] = \
             np.random.randint(0, self.x_train.shape[0], size=self.update_size)
 
-        self.memory_point = (self.memory_point+1)%Args.memory_divider
+        self.memory_point = (self.memory_point+1) % Args.memory_divider
 
         return self.x_train[self.memory]
+
+    #def binary_noise_from_memory(self):
+
 
     def binary_noise(self, max_noise=0.3, size=Args.batch_size):
         binary = np.random.choice([-1, 1-max_noise, 0-max_noise/2], size=(size, Args.latent_dim,),
                                   p=[0.45, 0.45, 0.1])
-
         noisy_binary = binary + np.random.random_sample(size=binary.shape)*max_noise
-
         return noisy_binary
 
 
@@ -96,7 +98,7 @@ class ModelContainer:
     def make_model(self):
         def base_conv(x, nodes=Args.node_count, mode=None, dropout=True):
             if dropout:
-                x = Dropout(.5)(x)
+                x = Dropout(.25)(x)
             x = Conv2D(nodes, (3, 3), padding='same')(x)
             # x = BatchNormalization()(x)
             x = LeakyReLU()(x)
@@ -120,7 +122,7 @@ class ModelContainer:
             layer = base_conv(layer, Args.node_count * 4, 'up')
             layer = base_conv(layer, Args.node_count * 2, 'up')
             layer = base_conv(layer, Args.node_count)
-            output_img = Conv2D(1, (3, 3), activation='simgoid', padding='same')(layer)
+            output_img = Conv2D(1, (3, 3), activation='sigmoid', padding='same')(layer)
             return output_img
 
         def make_discriminator(image_input):
@@ -179,8 +181,8 @@ class ModelContainer:
         self.full_gan.add_loss(gan_loss)
 
     def compile_gan(self):
-        opt = Adam(lr=4*10**-5, clipnorm=.5)
-        #opt = RMSprop(lr=10**-4)
+        #opt = Adam(lr=4*10**-5, clipnorm=.5)
+        opt = RMSprop(lr=0.5*10**-4)
         # opt = Adadelta(lr=10**-3)
         # opt = SGD(lr=10**-8)
         self.full_gan.compile(optimizer=opt)
@@ -200,6 +202,10 @@ class GAN:
 
         self.recent_losses = np.zeros(5)
 
+
+        self.test_length = 1000
+        self.checkpoint_noises = [self.dg.binary_noise(size=self.test_length) for _ in [0, 1]]
+
     def main(self):
         self.train()
         self.draw()
@@ -217,17 +223,21 @@ class GAN:
               (time.clock(), np.mean(predicts[0]), np.mean(predicts[1]), np.mean(predicts[2]), loss, loss_variation))
 
     def train(self):
+        self.weigthsave('previous')
         for i in range(Args.number_of_batches):
             self.train_batch()
-            if i % Args.log_frequency == 0:
 
-                for loss_index in range(5):
-                    self.recent_losses[loss_index] = self.train_batch()
-                self.progress_print()
-                self.draw()
-                if np.isnan(self.recent_losses[0]):
-                    print('encountered nan, ending...')
-                    quit()
+            if i % Args.log_frequency in range(5):
+                self.recent_losses[i % Args.log_frequency] = self.train_batch()
+                if i % Args.log_frequency == (5-1):
+                    #self.progress_print()
+                    self.draw()
+
+                    if np.isnan(self.recent_losses[0]):
+                        print('encountered nan, ending...')
+                        quit()
+
+                    self.checkpoint()
 
     def train_batch(self):
         batch_loss = self.md.full_gan.train_on_batch([self.dg.data_generator(),
@@ -235,6 +245,56 @@ class GAN:
         self.md.update_frozen()
 
         return batch_loss
+
+    def checkpoint(self):
+        self.weigthsave('current')
+
+        predicts = self.md.full_gan.predict([self.dg.x_test[0:self.test_length], self.checkpoint_noises[0], self.checkpoint_noises[1]])
+
+        loss = np.mean(self.recent_losses)
+        loss_variation = np.mean(np.abs(self.recent_losses[1:] - self.recent_losses[:-1]))
+
+        print('time:%5d, trues: %.4f, fakes: %.4f, generator: %.4f, batch_loss: %3.2f, loss_variation: %3.3f' %
+              (time.clock(), np.mean(predicts[0]), np.mean(predicts[1]), np.mean(predicts[2]), loss, loss_variation))
+
+
+
+        self.weigthload('previous', 'g')
+        predicts_prev_generator = self.md.full_gan.predict([self.dg.x_test[0:self.test_length], self.checkpoint_noises[0], self.checkpoint_noises[1]])
+        #print('preg:%5d, trues: %.4f, fakes: %.4f, generator: %.4f' %
+        #      (time.clock(), np.mean(predicts_prev_generator[0]), np.mean(predicts_prev_generator[1]), np.mean(predicts_prev_generator[2])))
+
+        if np.mean(predicts[2]) > np.mean(predicts_prev_generator[2]):
+            self.weigthload('current', 'g')
+        else:
+            print('returned to previous checkpoint of generator')
+
+
+        self.weigthload('previous', 'd')
+        predicts_prev_discriminator = self.md.full_gan.predict([self.dg.x_test[0:self.test_length], self.checkpoint_noises[0], self.checkpoint_noises[1]])
+        #print('pred:%5d, trues: %.4f, fakes: %.4f, generator: %.4f' %
+        #      (time.clock(), np.mean(predicts_prev_discriminator[0]), np.mean(predicts_prev_discriminator[1]), np.mean(predicts_prev_discriminator[2])))
+
+        if (np.mean(predicts[0]) - np.mean(predicts[1])) > (np.mean(predicts_prev_discriminator[0]) - np.mean(predicts_prev_discriminator[1])):
+            self.weigthload('current', 'd')
+        else:
+            print('returned to previous checkpoint of discriminator')
+
+        self.weigthsave('previous')
+
+    def weigthload(self, name_prefix='', model=None):
+        if model == 'g':
+            self.md.generator.load_weights(name_prefix + '_weigths_generator.h5')
+        elif model == 'd':
+            self.md.discriminator.load_weights(name_prefix+'_weigths_discriminator.h5')
+        else:
+            self.md.generator.load_weights(name_prefix + '_weigths_generator.h5')
+            self.md.discriminator.load_weights(name_prefix + '_weigths_discriminator.h5')
+        self.md.update_frozen()
+
+    def weigthsave(self, name_prefix=''):
+        self.md.discriminator.save_weights(name_prefix+'_weigths_discriminator.h5', overwrite=True)
+        self.md.generator.save_weights(name_prefix+'_weigths_generator.h5', overwrite=True)
 
     def draw(self):
         if Args.latent_dim != 2:
