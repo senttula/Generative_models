@@ -31,7 +31,7 @@ class Args:
     log_frequency = number_of_batches//50
 
     latent_dim = 2
-    node_count = 2**3
+    node_count = 2**2
 
     original_dim = None
     input_shape = None
